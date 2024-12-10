@@ -1,0 +1,39 @@
+name: Packer Validation
+
+on:
+  pull_request:
+    branches:
+        - main
+
+jobs:
+  build:
+    name: Packer Status Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup packer
+        uses: hashicorp/setup-packer@main
+        id: setup
+        with:
+          version: latest
+
+      - name: Install plugins
+        run: packer init app/packer/aws_ami.pkr.hcl
+
+      - name: Run packer fmt
+        run: packer fmt -check app/packer/aws_ami.pkr.hcl
+
+      - name: Run packer validate
+        run: |
+          packer validate \
+          -var "vpc_id=${{secrets.VPC_ID}}" \
+          -var "subnet_id=${{secrets.SUBNET_ID}}" \
+          -var "MYSQL_USER=${{secrets.DB_USER}}" \
+          -var "MYSQL_PASSWORD=${{secrets.DB_PASSWORD}}" \
+          -var "MYSQL_DATABASE=${{secrets.DB_NAME}}" \
+          -var "DEMO_ACCOUNT_ID=${{secrets.DEMO_ACCOUNT_ID}}" \
+          -var "DEV_ACCOUNT_ID=${{secrets.DEV_ACCOUNT_ID}}" \
+          app/packer/.

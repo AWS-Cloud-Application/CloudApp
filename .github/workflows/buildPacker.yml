@@ -1,0 +1,191 @@
+name: Packer Build
+
+on:
+  push:
+    branches:
+        - main
+
+jobs:
+  build:
+    name: Packer Build Check
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:latest
+        env:
+          MYSQL_ROOT_PASSWORD: ${{secrets.DB_PASSWORD}}
+          MYSQL_DATABASE: ${{secrets.DB_NAME}}
+          MYSQL_USER: ${{secrets.DB_USER}}
+          MYSQL_PASSWORD: ${{secrets.DB_PASSWORD}}
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+      # Step to create .env file with secret values
+    - name: Create .env file
+      run: |
+        touch .env
+        echo "PORT=${{secrets.PORT}}" >> .env
+        echo "DB_NAME=${{secrets.DB_NAME}}" >> .env
+        echo "DB_PASSWORD=${{secrets.DB_PASSWORD}}" >> .env
+        echo "DB_USER=${{secrets.DB_USER}}" >> .env
+        echo "DB_HOST=${{secrets.DB_HOST}}" >> .env
+        cat .env
+
+    - name: Zip Webapp Directory
+      run: zip -r webapp.zip .
+
+    - name: Check if webapp.zip Exists
+      run: |
+        if [ -f ./webapp.zip ]; then
+          echo "webapp.zip exists."
+        else
+          echo "webapp.zip does not exist."
+          exit 1
+        fi
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: "20.x"
+
+    - name: Install Dependencies
+      run: npm i
+
+    - name: Configure Environment Variables
+      run: |
+        echo DB_USER=${{ secrets.DB_USER }}
+        echo DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+        echo DB_NAME=${{ secrets.DB_NAME }}
+        echo DB_HOST=${{ secrets.DB_HOST }}
+        echo PORT=${{ secrets.PORT }}
+
+    - name: Wait for MySQL
+      run: |
+        until mysqladmin ping -h "127.0.0.1" --silent; do
+          echo "Waiting for MySQL to be ready..."
+          sleep 5
+        done
+
+    - name: Run Test
+      run: npm test -- --forceExit
+      env:
+        PORT: ${{secrets.PORT}}
+        DB_NAME: ${{secrets.DB_NAME}}
+        DB_PASSWORD: ${{secrets.DB_PASSWORD}}
+        DB_USER: ${{secrets.DB_USER}}
+        HOST: ${{secrets.DB_HOST}}
+        ENVIORNMENT: ${{secrets.ENVIORNMENT}}
+
+    - name: Install AWS CLI
+      run: sudo apt-get install -y awscli
+
+    - name: Install Packer
+      run: sudo apt-get install -y packer
+
+    - name: Install plugins
+      run: packer init app/packer/.
+
+    - name: Validate Packer Template
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: ${{ secrets.REGION }}
+      run: |
+        packer validate \
+        -var "vpc_id=${{secrets.VPC_ID}}" \
+        -var "subnet_id=${{secrets.SUBNET_ID}}" \
+        -var "MYSQL_USER=${{secrets.DB_USER}}" \
+        -var "MYSQL_PASSWORD=${{secrets.DB_PASSWORD}}" \
+        -var "MYSQL_DATABASE=${{secrets.DB_NAME}}" \
+        -var "DEMO_ACCOUNT_ID=${{secrets.DEMO_ACCOUNT_ID}}" \
+        -var "DEV_ACCOUNT_ID=${{secrets.DEV_ACCOUNT_ID}}" \
+        app/packer/.
+
+    - name: Build Packer Image
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: ${{ secrets.REGION }}
+      run: |
+        packer build \
+        -var "vpc_id=${{secrets.VPC_ID}}" \
+        -var "subnet_id=${{secrets.SUBNET_ID}}" \
+        -var "MYSQL_USER=${{secrets.DB_USER}}" \
+        -var "MYSQL_PASSWORD=${{secrets.DB_PASSWORD}}" \
+        -var "MYSQL_DATABASE=${{secrets.DB_NAME}}" \
+        -var "DEMO_ACCOUNT_ID=${{secrets.DEMO_ACCOUNT_ID}}" \
+        -var "DEV_ACCOUNT_ID=${{secrets.DEV_ACCOUNT_ID}}" \
+        app/packer/.
+      
+    - name: Configure AWS CLI for Dev/Demo Account
+      run: |
+        if [ "${{ secrets.DEPLOY_ENVIRONMENT }}" = "dev" ]; then
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+        elif [ "${{ secrets.DEPLOY_ENVIRONMENT }}" = "demo" ]; then
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID_DEMO }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY_DEMO }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+        else
+          echo "Invalid deploy environment specified: ${{ secrets.DEPLOY_ENVIRONMENT }}"
+          exit 1
+        fi
+
+    - name: Get Launch Template Version
+      id: vars
+      run: |
+        latest_ami_id=$(aws ec2 describe-images --executable-users self \
+        --filters "Name=name,Values=\"${{ secrets.AMI_NAME }}*\"" \
+        --query 'Images | max_by(@, &CreationDate).ImageId' --output text)
+        echo "Latest AMI ID: $latest_ami_id"
+        echo "latest_ami=$latest_ami_id" >> $GITHUB_ENV
+
+        version_number=$(aws ec2 describe-launch-template-versions --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} --query 'sort_by(LaunchTemplateVersions, &VersionNumber)[-1].VersionNumber' --output text)
+        echo "Latest AMI version: $version_number"
+        echo "version_number=$version_number" >> $GITHUB_ENV
+ 
+    - name: Create new Launch Template version
+      id: create_lt_version
+      run: |
+        new_version_number=$(aws ec2 create-launch-template-version \
+          --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} \
+          --launch-template-data "{\"ImageId\":\"${{ env.latest_ami }}\"}" \
+          --source-version "${{ env.version_number }}" \
+          --query 'LaunchTemplateVersion.VersionNumber' --output text)
+        echo "New Launch Template Version: $new_version_number"
+        echo "new_version_number=$new_version_number" >> $GITHUB_ENV
+
+    - name: Autoscaling group instance refresh
+      run: |
+        REFRESH_ID=$(aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name ${{ secrets.AUTOSCALING_GROUP_NAME }} \
+          --strategy Rolling \
+          --desired-configuration "{\"LaunchTemplate\":{\"LaunchTemplateName\":\"${{ secrets.LAUNCH_TEMPLATE_NAME }}\",\"Version\":\"${{ env.new_version_number }}\"}}" \
+          --query 'InstanceRefreshId' --output text)
+        echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+
+    - name: Wait for Instance Refresh
+      run: |
+        while true; do
+          STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name ${{ secrets.AUTOSCALING_GROUP_NAME }} --query "InstanceRefreshes[?InstanceRefreshId=='${REFRESH_ID}'].Status" --output text)
+          echo "Current Instance Refresh Status: $STATUS"
+          if [[ "$STATUS" == "Successful" ]]; then
+            echo "Instance Refresh Completed Successfully."
+            break
+          elif [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" ]]; then
+            echo "Instance Refresh Failed or Cancelled."
+            exit 1
+          fi
+          sleep 30
+        done
